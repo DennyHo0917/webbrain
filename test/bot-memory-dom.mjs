@@ -17,7 +17,10 @@ try {
     const { BotMemorySession, observeMemoryPageInPage, observeBotMemoryPage } = await import(`../src/${name}/src/agent/bot-memory.js`);
     const { Agent } = await import(`../src/${name}/src/agent/agent.js`);
     const api = { tabs: { get: async () => ({ url: page.url(), title: await page.title() }) },
-      scripting: { executeScript: async ({ args }) => [{ result: await page.evaluate(observeMemoryPageInPage, args[0]), frameId: 0 }] } };
+      scripting: { executeScript: async ({ args }) => {
+        if (page.url() === 'about:blank') throw new Error('Extension manifest must request permission to access this host');
+        return [{ result: await page.evaluate(observeMemoryPageInPage, args[0]), frameId: 0 }];
+      } } };
     globalThis.chrome = { ...api, storage: { local: { get: async () => ({}), set: async () => {} }, session: { get: async () => ({}), set: async () => {} } },
       runtime: { getURL: value => `chrome-extension://test/${value}`, sendMessage: async () => ({}) } };
     globalThis.browser = globalThis.chrome;
@@ -54,15 +57,20 @@ try {
       const session = new BotMemorySession(envelope(), { fetchImpl, observe: (tab, args) => observeBotMemoryPage(tab, args, api) });
       const agent = new Agent({ getActive: () => ({ model: 'test' }) });
       agent._botMemorySessions.set(7, session);
-      agent._executeToolWithLifecycle = async (_tab, tool) => {
+      agent._executeToolWithLifecycle = async (_tab, tool, args) => {
+        if (tool === 'navigate') { await page.goto(args.url); return { success: true }; }
         if (tool === 'click_ax') { await page.locator('button').click(); return { success: true }; }
         if (tool === 'read_page') return { success: true, text: await page.locator('body').innerText() };
         throw new Error('Unexpected fixture tool');
       };
       return { agent, session };
     };
-    await page.reload();
+    await page.goto('about:blank');
     let h = make();
+    const opened = await h.agent.executeTool(7, 'navigate', { url: `http://127.0.0.1:${port}/invoices/103` });
+    assert.equal(opened.success, true);
+    assert.equal(attempts.size, 0, 'Initial navigation does not fabricate an action reservation');
+    assert.equal(await page.evaluate(() => window.sentCount), 0);
     const sent = await h.agent.executeTool(7, 'click_ax', { selector: 'button' });
     assert.equal(sent.success, true);
     await h.agent.executeTool(7, 'read_page', {});

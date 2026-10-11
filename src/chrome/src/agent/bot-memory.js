@@ -169,21 +169,23 @@ export function observeMemoryPageInPage(args = {}) {
 export async function observeBotMemoryPage(tabId, args = {}, api = globalThis.chrome || globalThis.browser) {
   let raw = null;
   const framed = ['iframe_click', 'iframe_type', 'iframe_read'].includes(args.toolName);
-  if (api?.scripting?.executeScript) {
-    const values = await api.scripting.executeScript({ target: framed ? { tabId, allFrames: true } : { tabId, frameIds: [0] }, func: observeMemoryPageInPage, args: [args] });
-    const matches = framed ? values.filter(value => value.frameId !== 0 && typeof args.urlFilter === 'string'
-      && value.result?.url?.includes(args.urlFilter)) : values;
-    raw = matches?.length === 1 ? matches[0]?.result : null;
-  } else if (api?.tabs?.executeScript) {
-    const code = `(${observeMemoryPageInPage.toString()})(${JSON.stringify(args)})`;
-    const values = await api.tabs.executeScript(tabId, framed ? { allFrames: true, code } : { frameId: 0, code });
-    const matches = framed ? values.filter(value => typeof args.urlFilter === 'string' && value?.url?.includes(args.urlFilter)) : values;
-    raw = matches?.length === 1 ? matches[0] : null;
-  }
-  if (framed && !raw) return { url: '', title: '', targets: [], observedAt: Date.now(), elementFacts: { found: false }, text: '' };
+  try {
+    if (api?.scripting?.executeScript) {
+      const values = await api.scripting.executeScript({ target: framed ? { tabId, allFrames: true } : { tabId, frameIds: [0] }, func: observeMemoryPageInPage, args: [args] });
+      const matches = framed ? values.filter(value => value.frameId !== 0 && typeof args.urlFilter === 'string'
+        && value.result?.url?.includes(args.urlFilter)) : values;
+      raw = matches?.length === 1 ? matches[0]?.result : null;
+    } else if (api?.tabs?.executeScript) {
+      const code = `(${observeMemoryPageInPage.toString()})(${JSON.stringify(args)})`;
+      const values = await api.tabs.executeScript(tabId, framed ? { allFrames: true, code } : { frameId: 0, code });
+      const matches = framed ? values.filter(value => typeof args.urlFilter === 'string' && value?.url?.includes(args.urlFilter)) : values;
+      raw = matches?.length === 1 ? matches[0] : null;
+    }
+  } catch { /* Browser-internal pages and unavailable hosts have no DOM evidence. */ }
   if (!raw || typeof raw !== 'object') {
-    const tab = await api.tabs.get(tabId);
-    raw = { url: tab.url, title: tab.title || '', observedAt: Date.now(), elementFacts: { found: false }, links: [], identifiers: [] };
+    // Tab metadata alone cannot prove an observed control or business entity.
+    // In particular, an HTTP host-permission failure must remain fail-closed.
+    return { url: '', title: '', targets: [], observedAt: Date.now(), elementFacts: { found: false }, text: '' };
   }
   const url = safeUrl(raw.url);
   const targets = [];
@@ -219,10 +221,12 @@ export const BOT_MEMORY_TOOLS = [
 ];
 
 export class BotMemorySession {
-  constructor(config, { fetchImpl = globalThis.fetch, observe = observeBotMemoryPage } = {}) {
+  constructor(config, { fetchImpl = globalThis.fetch, observe = observeBotMemoryPage,
+    getTab = tabId => (globalThis.chrome || globalThis.browser).tabs.get(tabId) } = {}) {
     this.config = normalizeTaskMemory(config);
     this.fetchImpl = fetchImpl;
     this.observe = observe;
+    this.getTab = getTab;
     this.lastObservation = null;
     this.pending = new Map();
     this.knownAttempts = new Map();
@@ -265,6 +269,19 @@ export class BotMemorySession {
     this.lastObservation = await this.observe(tabId, { ...args, toolName: name });
     return this.lastObservation;
   }
+  async canBootstrapNavigation(tabId, name, args) {
+    if (name !== 'navigate' || typeof args?.url !== 'string' || args.url.length > 4096) return false;
+    let destination, tab;
+    try { destination = new URL(args.url); tab = await this.getTab(tabId); } catch { return false; }
+    if (!['http:', 'https:'].includes(destination.protocol) || destination.username || destination.password) return false;
+    // Use trusted browser metadata solely to escape a fresh blank/new-tab
+    // document, where content scripts are forbidden. No destination entity is
+    // fabricated and no write reservation is granted by this read bootstrap.
+    const current = typeof tab?.url === 'string' ? tab.url : '';
+    if (tab?.url && tab?.pendingUrl && tab.pendingUrl !== tab.url) return false;
+    return ['about:blank', 'about:newtab', 'about:home', 'chrome://newtab/',
+      'chrome://new-tab-page/', 'edge://newtab/', 'chrome-search://local-ntp/local-ntp.html'].includes(current);
+  }
   async prepare(tabId, name, args) {
     if (this.pending.size && (name === 'done_json' || (name === 'done' && !['partial', 'failed'].includes(args?.outcome)))) {
       return { allowed: false, reason: 'A dispatched action still has an uncertain outcome. Read its result and use bot_memory_verify before claiming success, or finish with an honest partial/failed outcome.' };
@@ -275,6 +292,7 @@ export class BotMemorySession {
     if (['execute_js', 'schedule_task', 'schedule_resume'].includes(name)) {
       return { allowed: false, reason: 'Use observable browser tools for this memory-protected task.' };
     }
+    if (await this.canBootstrapNavigation(tabId, name, args)) return { allowed: true, readOnly: true, bootstrapNavigation: true };
     const observation = await this.observation(tabId, name, args);
     if (!observation.url || !observation.targets.length) return { allowed: false, reason: 'Observe the target page before acting.' };
     const requestId = randomId();

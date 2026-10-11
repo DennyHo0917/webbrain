@@ -67,6 +67,60 @@ for (const browser of ['chrome', 'firefox']) {
     assert.match(evidence.facts.readResult, /Reminder sent/);
     assert.equal(h.session.pending.size, 0);
   });
+  test(`${browser}: first HTTP navigation escapes a browser blank page without a synthetic entity or reservation`, async () => {
+    for (const initial of ['about:blank', 'about:newtab', 'about:home', 'chrome://newtab/', 'chrome://new-tab-page/', 'edge://newtab/', 'chrome-search://local-ntp/local-ntp.html']) {
+      const h = harness();
+      let current = initial, observations = 0;
+      h.session.getTab = async () => ({ url: current });
+      h.session.observe = async () => { observations++; return observed(); };
+      h.agent._executeToolWithLifecycle = async (_tab, name) => {
+        h.pageActions.push(name);
+        if (name === 'navigate') current = target.url;
+        else assert.ok(h.calls.some(call => call.operation === 'dispatch'));
+        return { success: true };
+      };
+      assert.equal((await h.agent.executeTool(7, 'navigate', { url: target.url })).success, true);
+      assert.equal(observations, 0, 'Initial navigation must not inject into a browser-internal document');
+      assert.deepEqual(h.calls, [], 'No guessed entity or memory reservation for initial page access');
+      assert.equal((await h.agent.executeTool(7, 'click_ax', { ref_id: 'ref_5' })).success, true);
+      assert.deepEqual(h.calls.map(call => call.operation), ['prepare', 'dispatch']);
+      assert.equal(h.session.pending.size, 1);
+      await h.session.close();
+    }
+  });
+  test(`${browser}: blank-page bootstrap cannot authorize arbitrary controls, unsafe URLs or an in-flight HTTP page`, async () => {
+    for (const [name, args, tab] of [
+      ['click_ax', { ref_id: 'ref_5' }, { url: 'about:blank' }],
+      ['press_keys', { keys: ['ENTER'] }, { url: 'about:blank' }],
+      ['navigate', { url: 'javascript:alert(1)' }, { url: 'about:blank' }],
+      ['navigate', { url: 'file:///private' }, { url: 'about:blank' }],
+      ['navigate', { url: 'https://secret:password@example.test/' }, { url: 'about:blank' }],
+      ['navigate', { url: target.url }, { url: 'about:blank', pendingUrl: 'https://other.example.test/' }],
+      ['navigate', { url: target.url }, { pendingUrl: 'about:blank' }],
+      ['navigate', { url: target.url }, { url: 'about:blank?untrusted' }],
+      ['navigate', { url: target.url }, { url: 'chrome://newtab/other' }],
+      ['navigate', { url: target.url }, { url: 'https://other.example.test/' }],
+    ]) {
+      const h = harness();
+      h.session.getTab = async () => tab;
+      h.session.observe = async () => ({ url: '', title: '', targets: [], observedAt: Date.now(), elementFacts: { found: false }, text: '' });
+      assert.equal((await h.agent.executeTool(7, name, args)).noDispatch, true);
+      assert.deepEqual(h.calls, []);
+      assert.deepEqual(h.pageActions, []);
+    }
+  });
+  test(`${browser}: denied DOM scripting never promotes HTTP tab metadata into actionable evidence`, async () => {
+    const deniedApi = { ...api, scripting: { executeScript: async () => { throw new Error('Extension manifest must request permission to access this host'); } } };
+    const page = await observeBotMemoryPage(7, { toolName: 'click_ax', ref_id: 'ref_5' }, deniedApi);
+    assert.equal(page.url, '');
+    assert.deepEqual(page.targets, []);
+    assert.equal(page.elementFacts.found, false);
+    const h = harness();
+    h.session.observe = (tab, args) => observeBotMemoryPage(tab, args, deniedApi);
+    assert.equal((await h.agent.executeTool(7, 'click_ax', { ref_id: 'ref_5' })).noDispatch, true);
+    assert.deepEqual(h.pageActions, []);
+    assert.deepEqual(h.calls, []);
+  });
   test(`${browser}: duplicate, unavailable callback, ambiguous dispatch and stale target all block actual page input`, async () => {
     for (const options of [{ duplicate: true }, { callbackFailure: true }, { dispatchRejected: true }, { changedTarget: true }]) {
       const h = harness(options);
