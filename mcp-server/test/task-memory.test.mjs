@@ -13,7 +13,7 @@ await once(allocator, 'close');
 const { WebBrainBridge } = await import('../dist/bridge.js');
 const { startRun, getStatus, describeSnapshot } = await import('../dist/runs.js');
 const { bridgeUrl } = await import('../dist/config.js');
-const { validateTaskMemory } = await import('../dist/task-memory.js');
+const { validateTaskMemory, redactTaskMemory } = await import('../dist/task-memory.js');
 
 const memory = {
   version: 1, botId: 'bot-owned', runId: 'app-run-1', policyVersion: 1,
@@ -24,6 +24,8 @@ const memory = {
 };
 
 test('MCP validates private callbacks and bounded envelopes without exposing supplied data', () => {
+  const ordinary = { result: { callbackToken: 'ordinary requested field', taskMemory: { title: 'ordinary page content' } } };
+  assert.deepEqual(redactTaskMemory(ordinary), ordinary);
   assert.deepEqual(validateTaskMemory(memory), memory);
   for (const patch of [
     { botId: undefined }, { version: 2 }, { policyVersion: 0 },

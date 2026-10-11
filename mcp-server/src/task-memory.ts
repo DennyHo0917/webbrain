@@ -37,6 +37,7 @@ export function validateTaskMemory(value: unknown): TaskMemory {
 const privateKeys = new Set(["taskmemory", "botmemory", "taskmemoryciphertext", "taskmemoryrequired", "callbacktoken", "callbackurl"]);
 
 export function redactTaskMemory(value: unknown, secrets: Iterable<string> = [], depth = 0): unknown {
+  if ((Array.isArray(secrets) && !secrets.length) || (secrets instanceof Set && !secrets.size)) return value;
   if (depth > 32) return "[REDACTED]";
   if (typeof value === "string") {
     let safe = value;
