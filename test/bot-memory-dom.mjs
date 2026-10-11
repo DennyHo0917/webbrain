@@ -38,13 +38,14 @@ try {
         const attempt = { id: 'attempt-' + (++requestCount), status: 'reserved', requestId: args.requestId };
         attempts.set(attempt.id, attempt);
         return Response.json({ allowed: true, reservation: { attemptId: attempt.id, requestId: args.requestId,
-          actionKey: 'remind', target: args.observation.targets[0] } });
+          actionKey: 'remind', target: args.observation.targets.find(target => target.kind === 'id' && target.id === '103') } });
       }
       if (operation === 'dispatch') {
         const attempt = attempts.get(args.attemptId); attempt.status = 'dispatched'; return Response.json({ attempt });
       }
       if (operation === 'verify') {
         assert.match(args.evidence.facts.pageText, /Reminder sent for invoice 103/);
+        assert.equal(JSON.parse(args.evidence.facts.observedTarget).id, '103', 'Read-back observes the actual DOM identity, never echoes a reservation');
         const attempt = attempts.get(args.attemptId); attempt.status = 'verified'; return Response.json({ attempt });
       }
       return Response.json({ success: true });

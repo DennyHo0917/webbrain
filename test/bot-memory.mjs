@@ -20,7 +20,7 @@ const observed = () => ({ url: target.url, title: 'Invoice 103', targets: [targe
   elementFacts: { found: true, tag: 'BUTTON', type: 'submit', label: 'Send reminder', draftText: 'Invoice 103 is due.' }, text: 'Invoice 103. Send reminder.' });
 
 for (const browser of ['chrome', 'firefox']) {
-  const { BotMemorySession, normalizeTaskMemory, sanitizeMemoryArguments } = await import(`../src/${browser}/src/agent/bot-memory.js`);
+  const { BotMemorySession, normalizeTaskMemory, sanitizeMemoryArguments, memoryTargetIdentity, observeBotMemoryPage } = await import(`../src/${browser}/src/agent/bot-memory.js`);
   const { Agent } = await import(`../src/${browser}/src/agent/agent.js`);
   const { createCloudRunController } = await import(`../src/${browser}/src/cloud-runs.js`);
   function harness({ callbackFailure = false, duplicate = false, dispatchRejected = false, changedTarget = false } = {}) {
@@ -38,6 +38,7 @@ for (const browser of ['chrome', 'firefox']) {
         });
         if (operation === 'dispatch') return Response.json({ attempt: { id: 'attempt-1', status: dispatchRejected ? 'reserved' : 'dispatched' } });
         if (operation === 'verify') return Response.json({ attempt: { id: 'attempt-1', status: 'verified' } });
+        if (operation === 'resolve') return Response.json({ status: args.status, attempt: { id: args.attemptId, status: args.status } });
         return Response.json({ success: true });
       },
     });
@@ -113,17 +114,97 @@ for (const browser of ['chrome', 'firefox']) {
     assert.equal(h.session.pending.size, 1);
     await h.session.close();
   });
+  test(`${browser}: verification requires the actual fresh entity instead of copying a stored target`, async () => {
+    const h = harness();
+    await h.agent.executeTool(7, 'click_ax', { ref_id: 'ref_5' });
+    h.session.observe = async () => ({ ...observed(), url: 'https://example.test/invoices/104',
+      targets: [{ kind: 'url', url: 'https://example.test/invoices/104' }], text: 'Reminder sent for invoice 104.' });
+    const result = await h.agent.executeTool(7, 'bot_memory_verify', { attempt_id: 'attempt-1' });
+    assert.equal(result.success, false);
+    assert.match(result.error, /correct entity/);
+    assert.equal(h.calls.filter(call => call.operation === 'verify').length, 0);
+    assert.equal(h.session.pending.size, 1);
+    await h.session.close();
+  });
+  test(`${browser}: full-ledger lookup reconciles older uncertain actions absent from the context excerpt`, async () => {
+    const callbackCalls = [];
+    const previous = { id: 'old-attempt', botId: 'bot-1', runId: 'old-run', status: 'uncertain',
+      target: { kind: 'url', url: target.url + '?utm_source=test' }, dispatchedAt: Date.now() - 86400000 };
+    const session = new BotMemorySession(config(), { observe: async () => observed(),
+      fetchImpl: async (_url, options) => {
+        const { operation, args } = JSON.parse(options.body); callbackCalls.push({ operation, args });
+        return Response.json(operation === 'lookup' ? { allowed: false, reason: 'uncertain', previous }
+          : { verified: true, attempt: { id: previous.id, status: 'verified' } });
+      } });
+    assert.equal((await session.verify(7, previous.id)).success, false);
+    await session.tool(7, 'bot_memory_observe', {});
+    const lookup = await session.tool(7, 'bot_memory_lookup', { action_key: 'remind', target_index: 0 });
+    assert.equal(lookup.previous.id, previous.id);
+    assert.equal(session.pending.size, 0, 'Old attempts do not block unrelated new entities');
+    const verified = await session.tool(7, 'bot_memory_verify', { attempt_id: previous.id });
+    assert.equal(verified.verified, true);
+    assert.deepEqual(JSON.parse(callbackCalls.at(-1).args.evidence.facts.observedTarget), target);
+    assert.equal(session.knownAttempts.size, 0);
+    await session.close();
+  });
+  test(`${browser}: restart context can reconcile its own uncertain record but never a foreign bot`, async () => {
+    const previous = { id: 'previous-attempt', botId: 'bot-1', status: 'uncertain', target, dispatchedAt: Date.now() - 1000 };
+    const envelope = { ...config(), context: { recentActions: [previous, { ...previous, id: 'foreign-attempt', botId: 'bot-2' }] } };
+    const callbacks = [];
+    const session = new BotMemorySession(envelope, { observe: async () => observed(),
+      fetchImpl: async (_url, options) => { callbacks.push(JSON.parse(options.body)); return Response.json({ verified: true }); } });
+    assert.equal((await session.verify(7, 'foreign-attempt')).success, false);
+    assert.equal((await session.verify(7, previous.id)).verified, true);
+    assert.equal(callbacks.length, 1);
+    await session.close();
+  });
+  test(`${browser}: identity preserves generic SPA fragments and meaningful queries, with known video URL equivalence`, async () => {
+    assert.notEqual(memoryTargetIdentity({ kind: 'url', url: 'https://example.test/#!/invoice/103' }),
+      memoryTargetIdentity({ kind: 'url', url: 'https://example.test/#!/invoice/104' }));
+    assert.equal(memoryTargetIdentity({ kind: 'url', url: target.url + '?b=2&a=1&utm_source=test' }),
+      memoryTargetIdentity({ kind: 'url', url: target.url + '?a=1&b=2' }));
+    assert.notEqual(memoryTargetIdentity({ kind: 'url', url: target.url + '?a=1' }), memoryTargetIdentity(target));
+    assert.equal(memoryTargetIdentity({ kind: 'url', url: 'https://youtu.be/abcdefghijk?t=15' }),
+      memoryTargetIdentity({ kind: 'id', namespace: 'youtube.video', id: 'abcdefghijk' }));
+    const page = await observeBotMemoryPage(7, {}, { ...api, scripting: { executeScript: async () => [{ frameId: 0,
+      result: { ...observed(), url: 'https://example.test/#!/invoice/103', links: [], identifiers: [] } }] } });
+    assert.equal(page.targets[0].url, 'https://example.test/#!/invoice/103');
+  });
   test(`${browser}: explicit no-dispatch releases reservation, read access and unprotected work remain unchanged`, async () => {
     const h = harness();
     h.agent._executeToolWithLifecycle = async () => ({ success: false, noDispatch: true, dispatched: false });
     await h.agent.executeTool(7, 'set_field', { ref_id: 'ref_5', text: 'Reminder', submit: true });
     assert.equal(h.calls.at(-1).args.status, 'failed_before_dispatch');
+    assert.equal(h.calls.at(-1).args.evidence.facts.noDispatch, true);
+    assert.deepEqual(JSON.parse(h.calls.at(-1).args.evidence.facts.observedTarget), target);
+    assert.equal(h.calls.at(-1).args.evidence.tool, 'set_field');
     assert.equal(h.session.pending.size, 0);
     h.agent._botMemorySessions.delete(7);
     let calls = 0;
     h.agent._executeToolWithLifecycle = async () => { calls++; return { success: true }; };
     assert.equal((await h.agent.executeTool(7, 'execute_js', { code: 'document.title' })).success, true);
     assert.equal(calls, 1);
+  });
+  test(`${browser}: a missing release acknowledgement keeps the durable write uncertain`, async () => {
+    const h = harness();
+    const previousFetch = h.session.fetchImpl;
+    h.session.fetchImpl = async (url, options) => JSON.parse(options.body).operation === 'resolve'
+      ? Response.json({ acknowledged: false }) : previousFetch(url, options);
+    h.agent._executeToolWithLifecycle = async () => ({ success: false, noDispatch: true, dispatched: false });
+    await h.agent.executeTool(7, 'set_field', { ref_id: 'ref_5', text: 'Reminder', submit: true });
+    assert.equal(h.session.pending.size, 1);
+    assert.equal((await h.agent.executeTool(7, 'done', { outcome: 'success' })).blockedDone, true);
+    await h.session.close();
+  });
+  test(`${browser}: iframe action verification re-reads the actual document containing its selected control`, async () => {
+    const h = harness();
+    await h.agent.executeTool(7, 'iframe_click', { selector: 'button', urlFilter: 'example.test' });
+    const scope = [];
+    h.session.observe = async (_tab, args) => { scope.push(args); return observed(); };
+    await h.session.verify(7, 'attempt-1');
+    assert.deepEqual(scope[0], { toolName: 'iframe_read', urlFilter: target.url });
+    assert.equal(h.session.pending.size, 0);
+    await h.session.close();
   });
   test(`${browser}: protected scripts cannot bypass the guard and lookups cannot invent target identifiers`, async () => {
     const h = harness();
