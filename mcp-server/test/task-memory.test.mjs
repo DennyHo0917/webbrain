@@ -13,7 +13,7 @@ await once(allocator, 'close');
 const { WebBrainBridge } = await import('../dist/bridge.js');
 const { startRun, getStatus, describeSnapshot } = await import('../dist/runs.js');
 const { bridgeUrl } = await import('../dist/config.js');
-const { validateTaskMemory, redactTaskMemory } = await import('../dist/task-memory.js');
+const { validateTaskMemory, redactTaskMemory, redactMemoryRunResponse } = await import('../dist/task-memory.js');
 
 const memory = {
   version: 1, botId: 'bot-owned', runId: 'app-run-1', policyVersion: 1,
@@ -26,6 +26,13 @@ const memory = {
 test('MCP validates private callbacks and bounded envelopes without exposing supplied data', () => {
   const ordinary = { result: { callbackToken: 'ordinary requested field', taskMemory: { title: 'ordinary page content' } } };
   assert.deepEqual(redactTaskMemory(ordinary), ordinary);
+  const secrets = new Set([memory.callbackToken, memory.callbackUrl]);
+  assert.deepEqual(redactMemoryRunResponse({ runId: 'ordinary', ...ordinary }, secrets, new Set(['protected'])), { runId: 'ordinary', ...ordinary });
+  const listed = redactMemoryRunResponse({ runs: [{ runId: 'protected', ...ordinary }, { runId: 'ordinary', ...ordinary }], taskMemory: memory }, secrets, new Set(['protected']));
+  assert.equal(listed.taskMemory, undefined);
+  assert.deepEqual(listed.runs[0].result, {});
+  assert.deepEqual(listed.runs[1].result, ordinary.result);
+  assert.equal(redactTaskMemory(JSON.stringify({ ...memory, context: { notes: 'private-diagnostic-note' } }), secrets).includes('private-diagnostic-note'), false);
   assert.deepEqual(validateTaskMemory(memory), memory);
   for (const patch of [
     { botId: undefined }, { version: 2 }, { policyVersion: 0 },
@@ -56,11 +63,12 @@ test('MCP transports memory outside prompts and redacts credentials from status 
   extension.on('message', raw => {
     const message = JSON.parse(raw.toString());
     seen.push(message);
+    const ordinary = message.action === 'cloud_run' && !message.payload.taskMemory;
     extension.send(JSON.stringify(rejectNext
       ? { id: message.id, ok: false, status: 500, error: `failed ${memory.callbackToken}` }
       : { id: message.id, ok: true, result: {
-        runId: 'browser-run', status: message.action === 'cloud_status' ? 'failed' : 'running',
-        taskMemory: memory, result: { text: 'read', task_memory: memory },
+        runId: ordinary ? 'ordinary-run' : 'browser-run', status: message.action === 'cloud_status' ? 'failed' : 'running',
+        taskMemory: memory, result: ordinary ? { taskMemory: { title: 'ordinary field' }, callbackToken: 'ordinary token', callbackUrl: 'https://ordinary.example' } : { text: 'read', task_memory: memory },
         error: `uncertain ${memory.callbackToken}`, updates: [{ note: memory.callbackToken, callbackToken: memory.callbackToken }],
       } }));
   });
@@ -76,6 +84,8 @@ test('MCP transports memory outside prompts and redacts credentials from status 
     assert.equal(JSON.stringify(failed).includes(memory.callbackToken), false);
     assert.equal(JSON.stringify(failed).includes('taskMemory'), false);
     assert.equal(describeSnapshot(failed).includes(memory.callbackToken), false);
+    const ordinary = await startRun(bridge, { runId: 'ordinary-run', task: 'Ordinary', mode: 'ask' });
+    assert.deepEqual(ordinary.result, { taskMemory: { title: 'ordinary field' }, callbackToken: 'ordinary token', callbackUrl: 'https://ordinary.example' });
     rejectNext = true;
     await assert.rejects(getStatus(bridge, 'browser-run'), error => error.status === 500 && !error.message.includes(memory.callbackToken));
   } finally { extension.close(); await bridge.stop(); }

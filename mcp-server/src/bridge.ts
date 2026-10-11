@@ -19,7 +19,7 @@
 
 import { WebSocketServer, type WebSocket } from "ws";
 import { config } from "./config.js";
-import { BOT_MEMORY_CAPABILITY, validateTaskMemory, redactTaskMemory } from "./task-memory.js";
+import { BOT_MEMORY_CAPABILITY, validateTaskMemory, redactTaskMemory, redactMemoryRunResponse } from "./task-memory.js";
 
 /** Actions already present in the extension's ALLOWED_BRIDGE_ACTIONS set. */
 export type BridgeAction =
@@ -60,6 +60,7 @@ interface Pending {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   timer: NodeJS.Timeout;
+  protectedRequest?: boolean;
 }
 
 export class BridgeError extends Error {
@@ -103,6 +104,7 @@ export class WebBrainBridge {
   private handshakenSocket: WebSocket | null = null;
   private waiters: Array<() => void> = [];
   private memoryPrivateValues = new Set<string>();
+  private memoryProtectedRunIds = new Set<string>();
 
   async start(): Promise<void> {
     if (this.wss) return;
@@ -234,7 +236,12 @@ export class WebBrainBridge {
       entry.reject(new BridgeError(String(redactTaskMemory(msg.error || "Unknown bridge error", this.memoryPrivateValues)), status));
       return;
     }
-    entry.resolve(redactTaskMemory(msg.result, this.memoryPrivateValues));
+    if (entry.protectedRequest && msg.result && typeof msg.result === "object") {
+      const result = msg.result as Record<string, unknown>;
+      const runId = result.runId || result.run_id;
+      if (typeof runId === "string") this.memoryProtectedRunIds.add(runId);
+    }
+    entry.resolve(redactMemoryRunResponse(msg.result, this.memoryPrivateValues, this.memoryProtectedRunIds, entry.protectedRequest));
   }
 
   private failAllPending(error: Error): void {
@@ -288,6 +295,7 @@ export class WebBrainBridge {
       const memory = validateTaskMemory(payload.taskMemory);
       this.memoryPrivateValues.add(memory.callbackToken);
       this.memoryPrivateValues.add(memory.callbackUrl);
+      if (typeof payload.runId === "string") this.memoryProtectedRunIds.add(payload.runId);
     }
     const socket = this.socket;
     if (!socket || !this.isConnected()) {
@@ -314,7 +322,8 @@ export class WebBrainBridge {
         );
       }, responseTimeoutMs);
 
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer,
+        protectedRequest: payload.taskMemory !== undefined || (typeof payload.runId === "string" && this.memoryProtectedRunIds.has(payload.runId)) });
 
       try {
         socket.send(frame);
@@ -333,6 +342,7 @@ export class WebBrainBridge {
   async stop(): Promise<void> {
     this.failAllPending(new BridgeError("Bridge shutting down."));
     this.memoryPrivateValues.clear();
+    this.memoryProtectedRunIds.clear();
     if (this.socket) {
       try {
         this.socket.close(1001, "Server shutting down");

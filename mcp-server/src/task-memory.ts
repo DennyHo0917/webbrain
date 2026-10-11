@@ -36,17 +36,32 @@ export function validateTaskMemory(value: unknown): TaskMemory {
 
 const privateKeys = new Set(["taskmemory", "botmemory", "taskmemoryciphertext", "taskmemoryrequired", "callbacktoken", "callbackurl"]);
 
-export function redactTaskMemory(value: unknown, secrets: Iterable<string> = [], depth = 0): unknown {
+export function redactTaskMemory(value: unknown, secrets: Iterable<string> = [], depth = 0, stripPrivateKeys = true): unknown {
   if ((Array.isArray(secrets) && !secrets.length) || (secrets instanceof Set && !secrets.size)) return value;
   if (depth > 32) return "[REDACTED]";
   if (typeof value === "string") {
     let safe = value;
-    for (const secret of secrets) if (secret) safe = safe.split(secret).join("[REDACTED]");
+    let reflected = false;
+    for (const secret of secrets) if (secret && safe.includes(secret)) {
+      reflected = true;
+      safe = safe.split(secret).join("[REDACTED]");
+    }
+    if (reflected && /"(?:task_?memory|bot_?memory|callback_?(?:token|url))"\s*:/i.test(value.replace(/\\"/g, '"'))) return "[Private bot memory omitted]";
     return safe;
   }
   if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map(item => redactTaskMemory(item, secrets, depth + 1));
+  if (Array.isArray(value)) return value.map(item => redactTaskMemory(item, secrets, depth + 1, stripPrivateKeys));
   return Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !privateKeys.has(key.toLowerCase().replace(/[^a-z0-9]/g, "")))
-    .map(([key, nested]) => [key, redactTaskMemory(nested, secrets, depth + 1)]));
+    .filter(([key]) => !stripPrivateKeys || !privateKeys.has(key.toLowerCase().replace(/[^a-z0-9]/g, "")))
+    .map(([key, nested]) => [key, redactTaskMemory(nested, secrets, depth + 1, stripPrivateKeys)]));
+}
+
+export function redactMemoryRunResponse(value: unknown, secrets: Iterable<string>, protectedRunIds: Set<string>, protectedRequest = false): unknown {
+  const result = value && typeof value === "object" ? value as Record<string, unknown> : null;
+  if (result && Array.isArray(result.runs)) {
+    return { ...redactTaskMemory(value, secrets) as Record<string, unknown>,
+      runs: result.runs.map(run => redactMemoryRunResponse(run, secrets, protectedRunIds)) };
+  }
+  return redactTaskMemory(value, secrets, 0,
+    protectedRequest || protectedRunIds.has(String(result?.runId || result?.run_id || "")));
 }
