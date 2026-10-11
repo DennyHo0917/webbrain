@@ -67,6 +67,15 @@ for (const browser of ['chrome', 'firefox']) {
     assert.match(evidence.facts.readResult, /Reminder sent/);
     assert.equal(h.session.pending.size, 0);
   });
+  test(`${browser}: callback fetch keeps the browser global receiver`, async () => {
+    const session = new BotMemorySession(config(), { fetchImpl: async function (_url, options) {
+      assert.equal(this, globalThis, 'Native browser fetch rejects a session object receiver');
+      assert.equal(JSON.parse(options.body).operation, 'lookup');
+      return Response.json({ previous: null });
+    } });
+    assert.deepEqual(await session.call('lookup', { actionKey: 'remind', target }), { previous: null });
+    await session.close();
+  });
   test(`${browser}: first HTTP navigation escapes a browser blank page without a synthetic entity or reservation`, async () => {
     for (const initial of ['about:blank', 'about:newtab', 'about:home', 'chrome://newtab/', 'chrome://new-tab-page/', 'edge://newtab/', 'chrome-search://local-ntp/local-ntp.html']) {
       const h = harness();

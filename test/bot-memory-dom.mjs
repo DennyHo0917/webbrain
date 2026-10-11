@@ -1,12 +1,38 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
 import { chromium } from 'playwright';
 
 const html = `<!doctype html><html><head><title>Invoice 103</title><link rel="canonical" href="/invoices/103"></head><body>
 <section data-record-id="103"><h1>Invoice 103</h1><form><textarea name="reminder">Invoice 103 is due.</textarea>
 <input type="password" name="password" value="never-copy-this-password"><button type="submit">Send reminder</button></form>
 <p id="receipt"></p></section><script>window.sentCount=0;document.querySelector('form').addEventListener('submit',e=>{e.preventDefault();window.sentCount++;document.querySelector('#receipt').textContent='Reminder sent for invoice 103. Receipt reminder-103-'+window.sentCount;});</script></body></html>`;
-const server = createServer((_request, response) => { response.writeHead(200, { 'Content-Type': 'text/html' }); response.end(html); });
+const nativeCallbackRequests = [];
+const server = createServer(async (request, response) => {
+  const moduleName = /^\/bot-memory\/(chrome|firefox)\.js$/.exec(request.url);
+  if (moduleName) {
+    response.writeHead(200, { 'Content-Type': 'application/javascript' });
+    response.end(await readFile(new URL(`../src/${moduleName[1]}/src/agent/bot-memory.js`, import.meta.url)));
+    return;
+  }
+  const workerName = /^\/memory-worker\/(chrome|firefox)\.js$/.exec(request.url);
+  if (workerName) {
+    response.writeHead(200, { 'Content-Type': 'application/javascript' });
+    response.end(`import {BotMemorySession} from '/bot-memory/${workerName[1]}.js';
+      onmessage = async event => {try {const session = new BotMemorySession(event.data.config,
+        event.data.explicit ? {fetchImpl:globalThis.fetch} : {});
+        postMessage(await session.call('lookup', {actionKey:'remind',target:{kind:'id',namespace:'invoice',id:'103'}}));
+        await session.close();}catch(error){postMessage({error:error.message});}};`);
+    return;
+  }
+  if (request.method === 'POST' && /^\/api\/internal\/bot-memory\/run-(chrome|firefox)$/.test(request.url)) {
+    let body = ''; for await (const chunk of request) body += chunk;
+    nativeCallbackRequests.push({ ...JSON.parse(body), authorization: request.headers.authorization });
+    response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ previous: null }));
+    return;
+  }
+  response.writeHead(200, { 'Content-Type': 'text/html' }); response.end(html);
+});
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const port = server.address().port;
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -30,6 +56,23 @@ try {
       callbackUrl: `http://127.0.0.1:${port}/api/internal/bot-memory/run-${name}`, callbackToken: 'local-test-only-token'.repeat(3),
       policy: { schemaVersion: 1, summary: 'Send one reminder for each invoice.', timezone: 'UTC', confidence: 1,
         actions: [{ key: 'remind', label: 'Send reminder', target: 'Invoice', effect: 'write', repeat: { mode: 'unique' }, evidenceFields: ['receipt'] }] }, context: {} });
+    // Exercise actual browser-native fetch in both Window and WorkerGlobalScope.
+    // The Node fake callback below cannot reproduce the native receiver check.
+    for (const explicit of [false, true]) {
+      assert.deepEqual(await page.evaluate(async ({ name, config, explicit }) => {
+        const { BotMemorySession } = await import(`/bot-memory/${name}.js`);
+        const session = new BotMemorySession(config, explicit ? { fetchImpl: globalThis.fetch } : {});
+        try { return await session.call('lookup', { actionKey: 'remind', target: { kind: 'id', namespace: 'invoice', id: '103' } }); }
+        finally { await session.close(); }
+      }, { name, config: envelope(), explicit }), { previous: null });
+      assert.deepEqual(await page.evaluate(({ name, config, explicit }) => new Promise((resolve, reject) => {
+        const worker = new Worker(`/memory-worker/${name}.js`, { type: 'module' });
+        const timer = setTimeout(() => { worker.terminate(); reject(Error('Native worker callback timed out')); }, 5000);
+        worker.onmessage = event => { clearTimeout(timer); worker.terminate(); resolve(event.data); };
+        worker.onerror = () => { clearTimeout(timer); worker.terminate(); reject(Error('Native worker callback failed')); };
+        worker.postMessage({ config, explicit });
+      }), { name, config: envelope(), explicit }), { previous: null });
+    }
     const fetchImpl = async (_url, options) => {
       const { operation, args } = JSON.parse(options.body);
       assert.ok(!options.body.includes('never-copy-this-password'), 'DOM drafts never include password values');
@@ -86,6 +129,8 @@ try {
     await h.session.close();
     console.log(`${name}: observed generic invoice, one verified reminder, repeated reminder blocked before click.`);
   }
+  assert.equal(nativeCallbackRequests.length, 8, 'Each build calls native callbacks from Window and Worker with both dependency forms');
+  assert.ok(nativeCallbackRequests.every(request => request.operation === 'lookup' && request.authorization === 'Bearer ' + 'local-test-only-token'.repeat(3)));
 } finally {
   await browser.close();
   await new Promise(resolve => server.close(resolve));

@@ -224,7 +224,9 @@ export class BotMemorySession {
   constructor(config, { fetchImpl = globalThis.fetch, observe = observeBotMemoryPage,
     getTab = tabId => (globalThis.chrome || globalThis.browser).tabs.get(tabId) } = {}) {
     this.config = normalizeTaskMemory(config);
-    this.fetchImpl = fetchImpl;
+    // Browser fetch requires its Window/WorkerGlobalScope receiver. Calling a
+    // captured native fetch as a session method otherwise throws before HTTP.
+    this.fetchImpl = fetchImpl.bind(globalThis);
     this.observe = observe;
     this.getTab = getTab;
     this.lastObservation = null;
