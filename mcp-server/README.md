@@ -185,6 +185,8 @@ WebBrain exposes roughly fifty primitives internally — `click_ax`, `type_ax`, 
 
 ## Security notes
 
+Integrations can attach optional private `task_memory` to `webbrain_run`, separately from task text. The connected extension must advertise `bot_memory_v1` in `webbrain_connection`; older extensions reject protected runs before dispatch. The version-1 envelope contains `botId`, app `runId`, positive `policyVersion`, `callbackUrl`, scoped `callbackToken`, structured `policy`, and compact JSON `context`. Its maximum size is 128 KiB. Callbacks use HTTPS, or HTTP on literal loopback for a local app, at `/api/internal/bot-memory/:runId`, without URL credentials, query strings or fragments. Callback configuration is removed from snapshots and errors. Ordinary runs omit the envelope and retain their existing behavior.
+
 - The listener binds `127.0.0.1` only. Anything that can reach this port can drive your signed-in browser — never expose it to a network or a container bridge.
 - Connections from HTTP(S) pages and other non-extension browser origins are rejected before they can replace the extension socket. Accepted connections must also present the extension's `hello` frame with `client: "webbrain-extension"`; anything else is closed. This is **not** authentication. The shipping extension sends no shared secret, so a local process could impersonate it. Treat the port as trusted-local, and see [`docs/security-model.md`](../docs/security-model.md).
 - A `webbrain_run` timeout does **not** abort the run. A task that already submitted a form should not be silently killed — the browser keeps going and `webbrain_status` picks it back up.

@@ -19,6 +19,7 @@
 
 import { WebSocketServer, type WebSocket } from "ws";
 import { config } from "./config.js";
+import { BOT_MEMORY_CAPABILITY, validateTaskMemory, redactTaskMemory } from "./task-memory.js";
 
 /** Actions already present in the extension's ALLOWED_BRIDGE_ACTIONS set. */
 export type BridgeAction =
@@ -101,6 +102,7 @@ export class WebBrainBridge {
   private extensionProtocol: number | null = null;
   private handshakenSocket: WebSocket | null = null;
   private waiters: Array<() => void> = [];
+  private memoryPrivateValues = new Set<string>();
 
   async start(): Promise<void> {
     if (this.wss) return;
@@ -229,10 +231,10 @@ export class WebBrainBridge {
 
     if (msg.ok === false) {
       const status = typeof msg.status === "number" ? msg.status : undefined;
-      entry.reject(new BridgeError(String(msg.error || "Unknown bridge error"), status));
+      entry.reject(new BridgeError(String(redactTaskMemory(msg.error || "Unknown bridge error", this.memoryPrivateValues)), status));
       return;
     }
-    entry.resolve(msg.result);
+    entry.resolve(redactTaskMemory(msg.result, this.memoryPrivateValues));
   }
 
   private failAllPending(error: Error): void {
@@ -277,6 +279,16 @@ export class WebBrainBridge {
     payload: Record<string, unknown> = {},
     timeoutMs = config.commandTimeoutMs,
   ): Promise<T> {
+    if (action === "cloud_run" && payload.taskMemory !== undefined) {
+      try { payload = { ...payload, taskMemory: validateTaskMemory(payload.taskMemory) }; }
+      catch { throw new BridgeError("Invalid task_memory envelope.", 400); }
+      if (!this.capabilities().includes(BOT_MEMORY_CAPABILITY)) {
+        throw new BridgeError("Update the browser extension before starting a task with bot memory.", 409);
+      }
+      const memory = validateTaskMemory(payload.taskMemory);
+      this.memoryPrivateValues.add(memory.callbackToken);
+      this.memoryPrivateValues.add(memory.callbackUrl);
+    }
     const socket = this.socket;
     if (!socket || !this.isConnected()) {
       throw new BridgeError(
@@ -320,6 +332,7 @@ export class WebBrainBridge {
 
   async stop(): Promise<void> {
     this.failAllPending(new BridgeError("Bridge shutting down."));
+    this.memoryPrivateValues.clear();
     if (this.socket) {
       try {
         this.socket.close(1001, "Server shutting down");
