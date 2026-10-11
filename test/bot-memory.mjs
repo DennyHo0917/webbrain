@@ -98,6 +98,21 @@ for (const browser of ['chrome', 'firefox']) {
     await h.session.close();
     assert.equal(h.calls.at(-1).args.status, 'uncertain');
   });
+  test(`${browser}: chat helper takes exactly one reservation at its actual guarded submit`, async () => {
+    const h = harness();
+    const dispatched = [];
+    h.agent._executeToolWithLifecycle = async (tab, name) => {
+      if (name === 'chat_send') return h.agent.executeTool(tab, 'set_field', { ref_id: 'ref_5', text: 'Invoice reminder', submit: true });
+      dispatched.push(name);
+      return { success: true };
+    };
+    const result = await h.agent.executeTool(7, 'chat_send', { text: 'Invoice reminder' });
+    assert.equal(result.success, true);
+    assert.deepEqual(dispatched, ['set_field']);
+    assert.deepEqual(h.calls.map(call => call.operation), ['prepare', 'dispatch']);
+    assert.equal(h.session.pending.size, 1);
+    await h.session.close();
+  });
   test(`${browser}: explicit no-dispatch releases reservation, read access and unprotected work remain unchanged`, async () => {
     const h = harness();
     h.agent._executeToolWithLifecycle = async () => ({ success: false, noDispatch: true, dispatched: false });

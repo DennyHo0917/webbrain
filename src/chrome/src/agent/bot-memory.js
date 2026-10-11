@@ -13,6 +13,11 @@ const OBSERVATION_TOOLS = new Set([
   'read_page', 'get_accessibility_tree', 'extract_data', 'read_page_source',
   'iframe_read', 'verify_form', 'read_downloaded_file', 'chat_observe',
 ]);
+// chat_send performs the only outbound mutation through executeTool(set_field,
+// submit:true), which must take the reservation. Reserving the outer helper as
+// well would block that same request as its own duplicate. The helper's state
+// and recipient checks still run before the guarded inner dispatch.
+const DELEGATED_GUARD_TOOLS = new Set(['chat_send']);
 const SECRET_KEY = /password|passwd|secret|token|authorization|cookie|credential|api.?key|otp|pin|binary|image|base64/i;
 const SAFE_ARGUMENTS = new Set(['ref_id', 'selector', 'text', 'key', 'keys', 'url', 'urlFilter', 'method', 'submit', 'clear', 'checked', 'x', 'y', 'tool_id', 'name', 'action', 'intent']);
 const compact = (value, max = 512) => String(value ?? '').slice(0, max);
@@ -212,7 +217,7 @@ export class BotMemorySession {
     if (this.pending.size && (name === 'done_json' || (name === 'done' && !['partial', 'failed'].includes(args?.outcome)))) {
       return { allowed: false, reason: 'A dispatched action still has an uncertain outcome. Read its result and use bot_memory_verify before claiming success, or finish with an honest partial/failed outcome.' };
     }
-    if (READ_TOOLS.has(name) || name.startsWith('bot_memory_')) return { allowed: true, readOnly: true };
+    if (READ_TOOLS.has(name) || DELEGATED_GUARD_TOOLS.has(name) || name.startsWith('bot_memory_')) return { allowed: true, readOnly: true };
     // Opaque scripts can issue many unobservable writes. One reservation cannot
     // bind or verify those effects; protected runs use the visible guarded UI.
     if (['execute_js', 'schedule_task', 'schedule_resume'].includes(name)) {
