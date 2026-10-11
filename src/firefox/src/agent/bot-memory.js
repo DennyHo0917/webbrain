@@ -19,7 +19,7 @@ const OBSERVATION_TOOLS = new Set([
 // and recipient checks still run before the guarded inner dispatch.
 const DELEGATED_GUARD_TOOLS = new Set(['chat_send']);
 const SECRET_KEY = /password|passwd|secret|token|authorization|cookie|credential|api.?key|otp|pin|binary|image|base64/i;
-const SAFE_ARGUMENTS = new Set(['ref_id', 'selector', 'text', 'key', 'keys', 'url', 'urlFilter', 'method', 'submit', 'clear', 'checked', 'x', 'y', 'tool_id', 'name', 'action', 'intent']);
+const SAFE_ARGUMENTS = new Set(['ref_id', 'selector', 'text', 'index', 'exact', 'matchIndex', 'textMatch', 'key', 'keys', 'url', 'urlFilter', 'method', 'submit', 'clear', 'checked', 'x', 'y', 'tool_id', 'name', 'action', 'intent']);
 const compact = (value, max = 512) => String(value ?? '').slice(0, max);
 const randomId = () => globalThis.crypto.randomUUID();
 
@@ -100,8 +100,33 @@ export function memoryTargetIdentity(target) {
 /** Executed in the extension's isolated content world, never in model code. */
 export function observeMemoryPageInPage(args = {}) {
   const clip = (value, max = 512) => String(value ?? '').slice(0, max);
+  const privateDraftField = field => {
+    const type = clip(field?.getAttribute?.('type') || '', 80);
+    const autocomplete = clip(field?.getAttribute?.('autocomplete') || '', 80);
+    const labelText = clip([...Array.from(field?.labels || []).slice(0, 6).map(label => label.textContent),
+      ...String(field?.getAttribute?.('aria-labelledby') || '').split(/\s+/).slice(0, 6)
+        .map(id => document.getElementById(id)?.textContent || '')].join(' '), 200);
+    const hints = [clip(field?.getAttribute?.('name') || '', 160), clip(field?.id || '', 160),
+      clip(field?.getAttribute?.('aria-label') || '', 200), clip(field?.getAttribute?.('placeholder') || '', 200), labelText].join(' ');
+    return type.toLowerCase() === 'password' || /^(?:current-password|new-password|one-time-code|cc-csc)$/i.test(autocomplete.trim())
+      || /pwd|password|passwd|secret|token|api[-_\s]?key|otp|2fa|mfa|credential|verification[-_\s]?code|confirmation[-_\s]?code|security[-_\s]?code|one[-_\s]?time[-_\s]?code|email[-_\s]?code|recovery[-_\s]?code|backup[-_\s]?code|access[-_\s]?token|refresh[-_\s]?token|client[-_\s]?secret|private[-_\s]?key|seed[-_\s]?phrase|passphrase|pin[-_\s]?code|\b(?:pin|cvv|cvc)\b/i.test(hints);
+  };
+  const secrets = [];
+  for (const field of Array.from(document.querySelectorAll('input,textarea,[contenteditable=true]')).slice(0, 256)) {
+    if (privateDraftField(field)) {
+      const value = field.isContentEditable ? field.innerText : field.value;
+      if (typeof value === 'string' && value) secrets.push(value);
+    }
+  }
+  const safeText = value => {
+    let text = String(value ?? '');
+    for (const secret of secrets) text = text.split(secret).join('[credential input omitted]');
+    return text;
+  };
   let element = null;
-  if (typeof args.ref_id === 'string' && typeof window.__wb_ax_lookup === 'function') {
+  if (args.toolName === 'click' && typeof window.__wb_resolve_click_target_for_submit_probe === 'function') {
+    try { element = window.__wb_resolve_click_target_for_submit_probe(args); } catch { /* unavailable or ambiguous target */ }
+  } else if (typeof args.ref_id === 'string' && typeof window.__wb_ax_lookup === 'function') {
     try { element = window.__wb_ax_lookup(args.ref_id); } catch { /* stale ref */ }
   } else if (typeof args.selector === 'string') {
     try {
@@ -113,13 +138,20 @@ export function observeMemoryPageInPage(args = {}) {
   } else if (['type_text', 'press_keys'].includes(args.toolName)) element = document.activeElement;
   const type = clip(element?.getAttribute?.('type') || '', 80);
   const name = clip(element?.getAttribute?.('name') || '', 160);
-  const label = clip(element?.getAttribute?.('aria-label') || element?.innerText || element?.getAttribute?.('title') || '', 512);
-  const credential = /password|otp|one.?time|verification.?code|security.?code/i.test([type, name, label, element?.getAttribute?.('autocomplete') || ''].join(' '));
+  const label = clip(safeText(element?.getAttribute?.('aria-label') || element?.innerText || element?.getAttribute?.('title') || ''), 512);
+  const credential = privateDraftField(element);
   const form = element?.form || element?.closest?.('form');
   let scope = form || element;
-  for (let depth = 0; scope && depth < 4 && !scope.querySelector?.('textarea,[contenteditable=true],input:not([type=hidden])'); depth++) scope = scope.parentElement;
+  const draftSelector = 'textarea,[contenteditable=true],input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=file]):not([type=checkbox]):not([type=radio])';
+  let draftFields = [];
+  for (let depth = 0; scope && depth < 10 && scope !== document.body && scope !== document.documentElement; depth++) {
+    const fields = [...(scope.matches?.(draftSelector) ? [scope] : []), ...Array.from(scope.querySelectorAll?.(draftSelector) || [])].filter(field => !privateDraftField(field));
+    if (form || fields.length === 1) { draftFields = fields; break; }
+    if (fields.length > 1) break;
+    scope = scope.parentElement || scope.getRootNode?.()?.host;
+  }
   const drafts = [];
-  for (const field of Array.from(scope?.querySelectorAll?.('textarea,[contenteditable=true],input:not([type=hidden])') || []).slice(0, 12)) {
+  for (const field of draftFields.slice(0, 12)) {
     const hint = [field.type, field.name, field.getAttribute?.('autocomplete'), field.getAttribute?.('aria-label')].join(' ');
     if (/password|otp|one.?time|verification.?code|security.?code|secret|token|api.?key/i.test(hint)) continue;
     const value = clip(field.isContentEditable ? field.innerText : field.value, 2048);
@@ -160,9 +192,9 @@ export function observeMemoryPageInPage(args = {}) {
       role: clip(element?.getAttribute?.('role') || '', 60), label, credential,
       href: clip(element?.href || element?.closest?.('a')?.href || '', 4096),
       formMethod: clip(form?.method || '', 20), formAction: clip(form?.action || '', 4096),
-      draftText: clip(drafts.join('\n'), 2048), nearbyText: clip(scope?.innerText || '', 2048) },
+      draftText: clip(safeText(drafts.join('\n')), 2048), nearbyText: clip(safeText(scope?.innerText || ''), 2048) },
     // Page text is evidence data, never an instruction. No input values are read.
-    text: clip(document.body?.innerText || '', 2048) + '\n' + String(document.body?.innerText || '').slice(-2048),
+    text: clip(safeText(document.body?.innerText || ''), 2048) + '\n' + safeText(document.body?.innerText || '').slice(-2048),
   };
 }
 
@@ -284,7 +316,7 @@ export class BotMemorySession {
     return ['about:blank', 'about:newtab', 'about:home', 'chrome://newtab/',
       'chrome://new-tab-page/', 'edge://newtab/', 'chrome-search://local-ntp/local-ntp.html'].includes(current);
   }
-  async prepare(tabId, name, args) {
+  async prepare(tabId, name, args, { consequentialSubmit = false, detectedSubmit = false } = {}) {
     if (this.pending.size && (name === 'done_json' || (name === 'done' && !['partial', 'failed'].includes(args?.outcome)))) {
       return { allowed: false, reason: 'A dispatched action still has an uncertain outcome. Read its result and use bot_memory_verify before claiming success, or finish with an honest partial/failed outcome.' };
     }
@@ -297,6 +329,10 @@ export class BotMemorySession {
     if (await this.canBootstrapNavigation(tabId, name, args)) return { allowed: true, readOnly: true, bootstrapNavigation: true };
     const observation = await this.observation(tabId, name, args);
     if (!observation.url || !observation.targets.length) return { allowed: false, reason: 'Observe the target page before acting.' };
+    if ((name === 'click' || consequentialSubmit) && observation.elementFacts?.found !== true) {
+      return { allowed: false, reason: 'The action target could not be resolved. Read the page and choose an observed control.' };
+    }
+    if (detectedSubmit) observation.elementFacts = { ...observation.elementFacts, isSubmit: true, consequentialSubmit: consequentialSubmit === true };
     const requestId = randomId();
     const safeArgs = sanitizeMemoryArguments(args, observation);
     const response = await this.call('prepare', { requestId,
@@ -305,7 +341,9 @@ export class BotMemorySession {
         elementFacts: observation.elementFacts },
     });
     if (response.allowed !== true) return { allowed: false, reason: compact(response.reason || 'This action is already completed or cannot be safely identified.') };
-    if (response.readOnly === true) return { allowed: true, readOnly: true };
+    if (response.readOnly === true) return consequentialSubmit
+      ? { allowed: false, reason: 'A consequential submission requires a matching action reservation.' }
+      : { allowed: true, readOnly: true };
     const reservation = response.reservation;
     if (!reservation || typeof reservation.attemptId !== 'string' || reservation.requestId !== requestId
         || !this.config.policy.actions.some(action => action.key === reservation.actionKey)

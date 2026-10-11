@@ -34060,7 +34060,15 @@ If the user has already named or confirmed this exact recipient, do NOT ask agai
     if (memoryCoordinates.block) return memoryCoordinates.block;
     args = memoryCoordinates.args;
     let prepared;
-    try { prepared = await memory.prepare(tabId, name, args || {}); }
+    if (name === 'click' && args?.index != null) {
+      const index = typeof args.index === 'number' || (typeof args.index === 'string' && /^\d+$/.test(args.index)) ? Number(args.index) : NaN;
+      if (!Number.isSafeInteger(index) || index < 0) return { success: false, botMemory: true, noDispatch: true, dispatched: false, error: 'Choose a valid observed element index.' };
+      args = { ...args, index };
+    }
+    const detected = executionContext?.detectedSubmitAction || executionContext?.detectedSubmit;
+    const detectedSubmit = detected?.isSubmit === true;
+    const consequentialSubmit = detectedSubmit && classifySubmitRisk(detected, detected.url).risk !== SubmitRisk.LOW_RISK_SEARCH;
+    try { prepared = await memory.prepare(tabId, name, args || {}, { detectedSubmit, consequentialSubmit }); }
     catch (error) { return { success: false, botMemory: true, noDispatch: true, dispatched: false, error: error.message }; }
     if (prepared.allowed !== true) return { success: false, botMemory: true, noDispatch: true,
       dispatched: false, retryable: false, ...(['done', 'done_json'].includes(name) ? { blockedDone: true } : {}), error: prepared.reason };
