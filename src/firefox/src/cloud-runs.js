@@ -3,6 +3,7 @@ import {
   finalizeSavedWorkflowDraft,
   normalizeSavedWorkflow,
 } from './agent/workflows.js';
+import { normalizeTaskMemory } from './agent/bot-memory.js';
 import { isCredentialField } from './agent/credential-fields.js';
 import { validateResumeArgs } from './agent/scheduler.js';
 import { PRIVATE_RESULT_TYPE, importPrivateResultRecipient, encryptPrivateResult } from './private-results.js';
@@ -591,6 +592,7 @@ function compactCloudRunForPersistence(run) {
     traceRunId: run?.traceRunId || null,
     parentRunId: run?.parentRunId || null,
     conversationKey: run?.conversationKey || null,
+    memoryProtected: run?.memoryProtected === true,
     providerId: run?.providerId || null,
     expectedModel: run?.expectedModel || null,
     mode: run?.mode || 'act',
@@ -1037,12 +1039,19 @@ export function createCloudRunController({
 
   async function startRunReserved(msg = {}) {
     await hydrate();
+    // A protected continuation supplies a fresh run-scoped envelope. Never
+    // recover callback credentials from persisted run snapshots or parents.
+    const taskMemory = normalizeTaskMemory(msg.taskMemory ?? msg.task_memory);
+    if (taskMemory && msg._workflow) throw cloudRunError('Memory-protected tasks require ordinary guarded browser execution.', 409);
     const recipient = msg.private_result_public_key == null
       ? null : await importPrivateResultRecipient(msg.private_result_public_key);
     const suppliedRunId = msg.runId ?? msg.run_id;
     const requestedRunId = suppliedRunId == null ? '' : String(suppliedRunId).trim();
     const parentRunId = String(msg.parentRunId || msg.parent_run_id || '').trim() || null;
     const savedParent = parentRunId ? runs.get(parentRunId) : null;
+    if (savedParent?.memoryProtected === true && !taskMemory) {
+      throw cloudRunError('A memory-protected continuation requires a fresh task memory configuration.', 409);
+    }
     const providerId = msg.providerId ?? msg.provider_id ?? savedParent?.providerId ?? null;
     const expectedModel = msg.expectedModel ?? msg.expected_model ?? savedParent?.expectedModel ?? null;
     if (providerId != null || expectedModel != null) {
@@ -1140,6 +1149,7 @@ export function createCloudRunController({
       conversationKey: conversationKey || parentRun?.conversationKey || null,
       providerId,
       expectedModel,
+      memoryProtected: !!taskMemory,
       status: 'running',
       workflowId: workflow?.id || null,
       traceRunId: null,
@@ -1262,6 +1272,7 @@ export function createCloudRunController({
             content = await agent.processMessage(tabId, prompt, publishUpdate, mode, [], {
               cloudRun: true,
               privateFinalResult: !!recipient,
+              ...(taskMemory ? { taskMemory } : {}),
               ...(providerId == null ? {} : { providerId }),
               independentRun: !continuation,
               trustedContinuation: continuation,

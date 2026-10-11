@@ -4,6 +4,7 @@ import { createSystemOneJudge, isSystemOneResponseContractError, systemOneFailur
 import { firefoxBidi } from '../bidi/client.js';
 import { SOCIAL_PLATFORMS, socialPublicationApiPlatform, normalizePublicationContract, publicationProgress, exactPublicationText, publicationMediaMatches, publicationContractMessages, publicationAuditMessages, publicationAuditAccepted } from './social-publish-contract.js';
 import { AGENT_TOOLS, AGENT_TOOL_NAMES, RESERVED_AGENT_TOOL_NAMES, getToolsForMode, SYSTEM_PROMPT_ASK, SYSTEM_PROMPT_ACT, SYSTEM_PROMPT_ACT_COMPACT, SYSTEM_PROMPT_ACT_MID, SYSTEM_PROMPT_DEV_APPENDIX } from './tools.js';
+import { BotMemorySession, BOT_MEMORY_TOOLS } from './bot-memory.js';
 import { rejectedCompletionRecovery } from './completion-recovery.js';
 import { validateToolArguments } from './tool-arguments.js';
 import { isSessionQuotaError, serializeConversationForSession, SESSION_CONVERSATION_BUDGET_BYTES, SESSION_CONVERSATION_RETRY_BUDGET_BYTES } from './conversation-persistence.js';
@@ -957,6 +958,7 @@ export class Agent extends LoopDetector {
     // tool result. Consequential actions stay blocked until a direct clarify
     // response or intentional Instant auto-approve arrives.
     this._clarificationAuthorizationGuards = new Map(); // tabId -> { source, authorized, conversationId, blockedAttempts, updatedAt }
+    this._botMemorySessions = new Map(); // ephemeral; callback credentials never persist
     this.cloudRunContexts = new Map(); // tabId -> { outputSchema, schemaRepairUsed }
     // Pending upload_file() user-picker calls awaiting file selection —
     // same pattern as clarify(). Keyed by tabId → (pickerId → {resolve, ts}).
@@ -23180,6 +23182,8 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
         : STANDALONE_CHAT_SYSTEM_PROMPT;
     }
     let prompt = this._isActionMode(mode) ? this._getActPrompt() : SYSTEM_PROMPT_ASK;
+    const botMemory = tabId == null ? null : this._botMemorySessions.get(tabId);
+    if (botMemory) prompt += `\n\n${botMemory.systemNote()}`;
     if (mode === 'dev') {
       prompt += `\n\n${SYSTEM_PROMPT_DEV_APPENDIX.trim()}`;
     }
@@ -31008,6 +31012,40 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
   }
 
   async executeTool(tabId, name, args, onUpdate = null, executionContext = null) {
+    const memory = this._botMemorySessions.get(tabId);
+    if (!memory) return this._executeToolWithLifecycle(tabId, name, args, onUpdate, executionContext);
+    if (name.startsWith('bot_memory_')) {
+      try { return await memory.tool(tabId, name, args || {}); }
+      catch (error) { return { success: false, botMemory: true, noDispatch: true, error: error.message }; }
+    }
+    args = this._normalizeContinuationToolArgs(name, args);
+    const memoryCoordinates = this._prepareClickCoordinates(tabId, name, args || {});
+    if (memoryCoordinates.block) return memoryCoordinates.block;
+    args = memoryCoordinates.args;
+    let prepared;
+    try { prepared = await memory.prepare(tabId, name, args || {}); }
+    catch (error) { return { success: false, botMemory: true, noDispatch: true, dispatched: false, error: error.message }; }
+    if (prepared.allowed !== true) return { success: false, botMemory: true, noDispatch: true,
+      dispatched: false, retryable: false, ...(['done', 'done_json'].includes(name) ? { blockedDone: true } : {}), error: prepared.reason };
+    // prepare+dispatch are outside the page-input deadline. They must both be
+    // confirmed before any page mutation can start, including workflow replay.
+    this._throwIfAborted(this._runAbortSignal(tabId));
+    try {
+      const result = await this._executeToolWithLifecycle(tabId, name, args, onUpdate, executionContext);
+      try { await memory.afterTool(tabId, name, args || {}, result, prepared); }
+      catch { if (result && typeof result === 'object') result.botMemoryWarning = 'Action history could not be reconciled; its outcome remains uncertain.'; }
+      if (prepared.reservation && result && typeof result === 'object') {
+        result.memoryAttemptId = prepared.reservation.attemptId;
+      }
+      return result;
+    } catch (error) {
+      // Dispatched reservations remain durable and uncertain; a later run must
+      // reconcile the page rather than authorize an automatic duplicate.
+      throw error;
+    }
+  }
+
+  async _executeToolWithLifecycle(tabId, name, args, onUpdate = null, executionContext = null) {
     const linked = this._linkAbortSignals(executionContext?._contentActionAbortSignal, this._runAbortSignal(tabId));
     const dispatchState = executionContext?._contentActionDispatchState || { started: false };
     // Every text-write route marks dispatch before content messaging or CDP input.
@@ -35339,6 +35377,10 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
     if (runOptions?.trustedContinuation !== true) this.persistenceDegradedTabs.delete(tabId);
     this._runUpdateCallbacks.set(tabId, onUpdate);
     this._runModeOverrides.set(tabId, mode);
+    const previousBotMemory = this._botMemorySessions.get(tabId);
+    const botMemorySession = runOptions.taskMemory ? new BotMemorySession(runOptions.taskMemory) : null;
+    if (botMemorySession) this._botMemorySessions.set(tabId, botMemorySession);
+    else this._botMemorySessions.delete(tabId);
     const previousCloudContext = this.cloudRunContexts.get(tabId);
     if (runOptions.cloudRun) {
       this.cloudRunContexts.set(tabId, { outputSchema: runOptions.outputSchema ?? null, schemaRepairUsed: false, deferResume: runOptions.deferResume, privateFinalResult: runOptions.privateFinalResult === true });
@@ -35349,6 +35391,9 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
       void this._maybeEmitAskModeHandoff(tabId, mode, userMessage, result, onUpdate, runOptions);
       return result;
     } finally {
+      if (botMemorySession) await botMemorySession.close();
+      if (previousBotMemory) this._botMemorySessions.set(tabId, previousBotMemory);
+      else this._botMemorySessions.delete(tabId);
       this.currentCostState.delete(tabId);
       this._discardProvisionalSelectionGroundingScope(tabId);
       this._storeContinuationExecutionEvidence(tabId);
@@ -35885,7 +35930,8 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
     // The selected text is already present in the trusted run envelope.
     // Advertising page/network tools would let an injected selection induce a
     // second source and defeat the selection-only boundary.
-    if (selectionOnly || standaloneChatRun) tools = [];
+    if (this._botMemorySessions.has(tabId)) tools = [...tools, ...BOT_MEMORY_TOOLS];
+      if (selectionOnly || standaloneChatRun) tools = [];
     let allowedToolNames = new Set(tools.map(t => t.function.name));
     let toolSchemas = new Map(tools.map(t => [t.function.name, t.function.parameters]));
     const plannerTemperature = this._isActionMode(mode) ? 0.15 : 0.3;
@@ -36112,6 +36158,7 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
         gmailResultCounting: !!getGmailResultCountPolicy(await this._currentUrl(tabId)),
         researchEscalationEnabled: this.researchEscalationEnabled,
       });
+      if (this._botMemorySessions.has(tabId)) tools = [...tools, ...BOT_MEMORY_TOOLS];
       if (selectionOnly || standaloneChatRun) tools = [];
       if (forceCompletionVerificationTurn) {
         const completionState = this.completionInvariants.get(tabId);
@@ -36786,6 +36833,10 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
     if (runOptions?.trustedContinuation !== true) this.persistenceDegradedTabs.delete(tabId);
     this._runUpdateCallbacks.set(tabId, onUpdate);
     this._runModeOverrides.set(tabId, mode);
+    const previousBotMemory = this._botMemorySessions.get(tabId);
+    const botMemorySession = runOptions.taskMemory ? new BotMemorySession(runOptions.taskMemory) : null;
+    if (botMemorySession) this._botMemorySessions.set(tabId, botMemorySession);
+    else this._botMemorySessions.delete(tabId);
     const previousCloudContext = this.cloudRunContexts.get(tabId);
     if (runOptions.cloudRun) {
       this.cloudRunContexts.set(tabId, { outputSchema: runOptions.outputSchema ?? null, schemaRepairUsed: false, deferResume: runOptions.deferResume, privateFinalResult: runOptions.privateFinalResult === true });
@@ -36796,6 +36847,9 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
       void this._maybeEmitAskModeHandoff(tabId, mode, userMessage, result, onUpdate, runOptions);
       return result;
     } finally {
+      if (botMemorySession) await botMemorySession.close();
+      if (previousBotMemory) this._botMemorySessions.set(tabId, previousBotMemory);
+      else this._botMemorySessions.delete(tabId);
       this.currentCostState.delete(tabId);
       this._discardProvisionalSelectionGroundingScope(tabId);
       this._storeContinuationExecutionEvidence(tabId);
@@ -37036,7 +37090,8 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
     });
     // Match the non-streaming path: selection-grounded turns are tool-free so
     // page or network content cannot be introduced after the source anchor.
-    if (selectionOnly || standaloneChatRun) tools = [];
+    if (this._botMemorySessions.has(tabId)) tools = [...tools, ...BOT_MEMORY_TOOLS];
+      if (selectionOnly || standaloneChatRun) tools = [];
     let allowedToolNames = new Set(tools.map(t => t.function.name));
     let toolSchemas = new Map(tools.map(t => [t.function.name, t.function.parameters]));
     const plannerTemperature = this._isActionMode(mode) ? 0.15 : 0.3;
@@ -37111,6 +37166,7 @@ Rules: no prose intro, no conclusion, no "this screenshot shows...", no layout d
         gmailResultCounting: !!getGmailResultCountPolicy(await this._currentUrl(tabId)),
         researchEscalationEnabled: this.researchEscalationEnabled,
       });
+      if (this._botMemorySessions.has(tabId)) tools = [...tools, ...BOT_MEMORY_TOOLS];
       if (selectionOnly || standaloneChatRun) tools = [];
       if (forceCompletionVerificationTurn) {
         const completionState = this.completionInvariants.get(tabId);
