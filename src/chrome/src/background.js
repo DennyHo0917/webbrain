@@ -240,7 +240,10 @@ const teacherRunInterlock = createTeacherRunInterlock(teacherSessionStore, {
     || scheduler.isRunning(tabId)
     || cloudRunController.isRunning(tabId),
 });
-agent.setRunStartGuard((tabId) => teacherRunInterlock.guardRunStart(tabId));
+agent.setRunStartGuard((tabId, context) => {
+  cloudRunController.guardRunStart(tabId, context);
+  return teacherRunInterlock.guardRunStart(tabId);
+});
 const profileSync = new ProfileSyncManager(chrome.storage.local);
 installDownloadDirectoryRouting(chrome);
 
@@ -2918,6 +2921,10 @@ async function handleMessage(msg, sender) {
     }
     case 'cloud_respond':
       return await cloudRunController.respond(msg);
+    case 'cloud_pause':
+      return await cloudRunController.pause(msg);
+    case 'cloud_resume':
+      return await cloudRunController.resume(msg);
     case 'cloud_abort':
       return await cloudRunController.abort(msg);
     case 'cloud_bridge_start':
